@@ -6,9 +6,10 @@ import torch.distributed as dist
 
 import dualpipe.comm as comm
 from dualpipe.utils import WeightGradStore, run_backward, scatter, gather
+from dualpipe.base import BaseDualPipe
 
 
-class DualPipeV(nn.Module):
+class DualPipeV(BaseDualPipe):
     def __init__(
         self,
         modules: Tuple[nn.Module, nn.Module],
@@ -16,49 +17,21 @@ class DualPipeV(nn.Module):
         process_group: Optional[dist.ProcessGroup] = None,
         rank_mapping: Optional[List[int]] = None,
     ) -> None:
-        super().__init__()
-
-        assert next(modules[0].parameters()).device == torch.device(torch.cuda.current_device())
-        self.module = nn.ModuleList(modules)
-        self.overlapped_forward_backward = type(modules[0]) == type(modules[1]) and hasattr(type(modules[0]), "overlapped_forward_backward")
-        self.batch_dim = batch_dim
-        self.group = process_group or dist.distributed_c10d._get_default_group()
-        self.num_ranks = self.group.size()
-
-        # rank_mapping: Map rank in process_group to actual pp rank.
-        # rank_inverse_mapping: Map actual pp rank to rank in process_group.
-        if rank_mapping is None:
-            rank_mapping = list(range(self.num_ranks))
-        rank_inverse_mapping = [None] * (self.num_ranks + 1)
-        for i in range(self.num_ranks):
-            rank_inverse_mapping[rank_mapping[i]] = i
-
-        self.rank = rank_mapping[self.group.rank()]
-        self.prev_rank = rank_inverse_mapping[self.rank - 1]
-        self.next_rank = rank_inverse_mapping[self.rank + 1]
-
-        self.is_first_rank = self.rank == 0
-        self.is_last_rank = self.rank == self.num_ranks - 1
+        # Use parent class initialization instead of duplicating logic
+        super().__init__(modules, batch_dim, process_group, rank_mapping)
 
     def _reset_states(self) -> None:
-        WeightGradStore.clear()
+        # Call parent class reset first
+        super()._reset_states()
 
-        self.input_chunks: Tuple[List[List[torch.Tensor]], List[List[torch.Tensor]]] = ([], [])
-        self.output_chunks: Tuple[List[List[torch.Tensor]], List[List[torch.Tensor]]] = ([], [])
-        self.input_grad_chunks: Tuple[List[List[torch.Tensor]], List[List[torch.Tensor]]] = ([], [])
-        self.output_grad_chunks: Tuple[List[List[torch.Tensor]], List[List[torch.Tensor]]] = ([], [])
+        # Add DualPipeV-specific fields
         self.labels: List[List[torch.Tensor]] = None
-        self.loss_chunks: List[torch.Tensor] = []
-        self.criterion: Callable = None
-
         self.current_f_chunk_id: List[int] = [0, 0]
         self.current_b_chunk_id: List[int] = [0, 0]
         self.current_send_f_chunk_id: List[int] = [0, 0]
         self.current_send_b_chunk_id: List[int] = [0, 0]
         self.current_recv_f_chunk_id: List[int] = [0, 0]
         self.current_recv_b_chunk_id: List[int] = [0, 0]
-        self.comm_ops: List[dist.P2POp] = []
-        self.to_free: List[torch.Tensor] = []
 
     def _forward_compute_chunk(self, phase: int) -> None:
         chunk_id = self.current_f_chunk_id[phase]
@@ -224,11 +197,7 @@ class DualPipeV(nn.Module):
         # Assume FIFO
         WeightGradStore.pop()
 
-    def _free_tensors(self) -> None:
-        for tensor in self.to_free:
-            assert tensor._base is None, f"pipeline stage should not return view tensors {dist.get_rank(), tensor.shape}"
-            tensor.data = torch.Tensor()
-        self.to_free = []
+    # Removed duplicated _free_tensors - using base class implementation with graceful view handling
 
     def _recv_forward(self, phase: int) -> None:
         if (self.is_first_rank and phase == 0) or (self.is_last_rank and phase == 1):
@@ -276,14 +245,7 @@ class DualPipeV(nn.Module):
 
         comm.append_isend(self.comm_ops, tensors, self.prev_rank if phase == 0 else self.next_rank, self.group)
 
-    def _commit_and_wait_comm(self) -> None:
-        if not self.comm_ops:
-            return
-        reqs = dist.batch_isend_irecv(self.comm_ops)
-        for req in reqs:
-            req.wait()
-        self.comm_ops = []
-        self._free_tensors()
+    # Removed duplicated _commit_and_wait_comm - using base class implementation
 
     def step(
         self,
