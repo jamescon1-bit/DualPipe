@@ -1,4 +1,5 @@
 import queue
+import threading
 from typing import List, Callable
 
 import torch
@@ -10,27 +11,32 @@ class WeightGradStore:
     enabled: bool = False
     cache: List[Callable] = []
     funcs_queue = queue.Queue()
+    _lock = threading.Lock()
 
     @classmethod
     def put(cls, func: Callable) -> None:
-        cls.cache.append(func)
+        with cls._lock:
+            cls.cache.append(func)
 
     @classmethod
     def flush(cls) -> None:
-        cls.funcs_queue.put(cls.cache)
-        cls.cache = []
+        with cls._lock:
+            cls.funcs_queue.put(cls.cache)
+            cls.cache = []
 
     @classmethod
     def pop(cls) -> None:
-        assert not cls.funcs_queue.empty(), "Pop empty queue."
-        funcs = cls.funcs_queue.get()
+        with cls._lock:
+            assert not cls.funcs_queue.empty(), "Pop empty queue."
+            funcs = cls.funcs_queue.get()
         for func in funcs:
             func()
 
     @classmethod
     def clear(cls) -> None:
-        cls.cache = []
-        cls.funcs_queue = queue.Queue()
+        with cls._lock:
+            cls.cache = []
+            cls.funcs_queue = queue.Queue()
 
 
 def run_backward(tensors: List[torch.Tensor], grad_tensors: List[torch.Tensor]) -> None:

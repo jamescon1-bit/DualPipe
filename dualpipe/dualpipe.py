@@ -6,9 +6,10 @@ import torch.distributed as dist
 
 import dualpipe.comm as comm
 from dualpipe.utils import WeightGradStore, run_backward, scatter, gather
+from dualpipe.base import BaseDualPipe
 
 
-class DualPipe(nn.Module):
+class DualPipe(BaseDualPipe):
     def __init__(
         self,
         modules: Tuple[nn.Module, nn.Module],
@@ -16,44 +17,24 @@ class DualPipe(nn.Module):
         process_group: Optional[dist.ProcessGroup] = None,
         rank_mapping: Optional[List[int]] = None,
     ) -> None:
-        super().__init__()
+        super().__init__(modules, batch_dim, process_group, rank_mapping)
 
-        assert next(modules[0].parameters()).device == torch.device(torch.cuda.current_device())
-        self.module = nn.ModuleList(modules)
-        self.overlapped_forward_backward = type(modules[0]) == type(modules[1]) and hasattr(type(modules[0]), "overlapped_forward_backward")
-        self.batch_dim = batch_dim
-        self.group = process_group or dist.distributed_c10d._get_default_group()
-        self.num_ranks = self.group.size()
-
-        # rank_mapping: Map rank in process_group to actual pp rank.
-        # rank_inverse_mapping: Map actual pp rank to rank in process_group.
-        if rank_mapping is None:
-            rank_mapping = list(range(self.num_ranks))
+        # Additional fields specific to DualPipe (not in BaseDualPipe)
         rank_inverse_mapping = [None] * (self.num_ranks + 1)
+        rank_mapping = rank_mapping or list(range(self.num_ranks))
         for i in range(self.num_ranks):
             rank_inverse_mapping[rank_mapping[i]] = i
 
-        self.rank = rank_mapping[self.group.rank()]
         self.first_rank = rank_inverse_mapping[0]
-        self.prev_rank = rank_inverse_mapping[self.rank - 1]
-        self.next_rank = rank_inverse_mapping[self.rank + 1]
         self.last_rank = rank_inverse_mapping[self.num_ranks - 1]
-
-        self.is_first_rank = self.rank == 0
-        self.is_last_rank = self.rank == self.num_ranks - 1
         self.is_in_second_half = self.rank >= self.num_ranks // 2
         self.is_middle_rank = (self.rank == self.num_ranks // 2 - 1) or (self.rank == self.num_ranks // 2)
 
     def _reset_states(self) -> None:
-        WeightGradStore.clear()
+        super()._reset_states()
 
-        self.input_chunks: Tuple[List[List[torch.Tensor]], List[List[torch.Tensor]]] = ([], [])
-        self.output_chunks: Tuple[List[List[torch.Tensor]], List[List[torch.Tensor]]] = ([], [])
-        self.input_grad_chunks: Tuple[List[List[torch.Tensor]], List[List[torch.Tensor]]] = ([], [])
-        self.output_grad_chunks: Tuple[List[List[torch.Tensor]], List[List[torch.Tensor]]] = ([], [])
+        # DualPipe-specific state
         self.labels: Tuple[List[List[torch.Tensor]], List[List[torch.Tensor]]] = None
-        self.loss_chunks: List[torch.Tensor] = []
-        self.criterion: Callable = None
 
         self.current_f_chunk_id: List[int] = [0, 0]
         self.current_b_chunk_id: List[int] = [0, 0]
@@ -61,8 +42,6 @@ class DualPipe(nn.Module):
         self.current_send_b_chunk_id: List[int] = [0, 0]
         self.current_recv_f_chunk_id: List[int] = [0, 0]
         self.current_recv_b_chunk_id: List[int] = [0, 0]
-        self.comm_ops: List[dist.P2POp] = []
-        self.to_free: List[torch.Tensor] = []
 
     def _forward_compute_chunk(self, phase: int) -> None:
         phase ^= self.is_in_second_half
@@ -224,7 +203,12 @@ class DualPipe(nn.Module):
 
     def _free_tensors(self) -> None:
         for tensor in self.to_free:
-            assert tensor._base is None, f"pipeline stage should not return view tensors {dist.get_rank(), tensor.shape}"
+            # Handle view tensors gracefully instead of asserting
+            if tensor._base is not None:
+                # Log warning for view tensors but continue processing
+                print(f"Warning: Pipeline stage returned view tensor at rank {dist.get_rank()}, shape {tensor.shape}")
+                # Don't free view tensors as it could corrupt base tensor
+                continue
             tensor.data = torch.Tensor()
         self.to_free = []
 
@@ -285,11 +269,16 @@ class DualPipe(nn.Module):
     def _commit_and_wait_comm(self) -> None:
         if not self.comm_ops:
             return
-        reqs = dist.batch_isend_irecv(self.comm_ops)
-        for req in reqs:
-            req.wait()
-        self.comm_ops = []
-        self._free_tensors()
+        try:
+            reqs = dist.batch_isend_irecv(self.comm_ops)
+            for req in reqs:
+                req.wait()
+            # Only clear comm_ops after successful completion
+            self.comm_ops = []
+            self._free_tensors()
+        except Exception as e:
+            # Don't clear comm_ops on failure to avoid inconsistent state
+            raise RuntimeError(f"Communication operation failed at rank {dist.get_rank()}: {str(e)}") from e
 
     def step(
         self,

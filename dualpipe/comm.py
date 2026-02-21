@@ -19,7 +19,16 @@ def set_p2p_tensor_dtype(dtype: torch.dtype):
 
 
 def build_from_tensor_shapes():
-    return [torch.empty(s, dtype=TENSOR_DTYPE, device="cuda", requires_grad=True) for s in TENSOR_SHAPES]
+    if TENSOR_SHAPES is None or TENSOR_DTYPE is None:
+        raise ValueError("TENSOR_SHAPES and TENSOR_DTYPE must be set before building tensors")
+    
+    tensors = []
+    for s in TENSOR_SHAPES:
+        if s is not None and len(s) > 0:  # Check for valid shapes
+            tensors.append(torch.empty(s, dtype=TENSOR_DTYPE, device="cuda", requires_grad=True))
+        else:
+            tensors.append(None)
+    return tensors
 
 
 def append_irecv(ops: List[dist.P2POp], src: int, group: dist.ProcessGroup) -> List[torch.Tensor]:
@@ -32,6 +41,9 @@ def append_irecv(ops: List[dist.P2POp], src: int, group: dist.ProcessGroup) -> L
 
 
 def append_isend(ops: List[dist.P2POp], tensors: List[torch.Tensor], dst: int, group: dist.ProcessGroup) -> None:
+    if tensors is None:
+        return  # Early return for None tensors list
+    
     dst = dist.distributed_c10d.get_global_rank(group, dst)
     for tensor in tensors:
         if tensor is not None:
